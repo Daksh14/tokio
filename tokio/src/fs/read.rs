@@ -45,5 +45,47 @@ use std::{io, path::Path};
 /// ```
 pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     let path = path.as_ref().to_owned();
+
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring",
+        feature = "rt",
+        feature = "fs",
+        target_os = "linux"
+    ))]
+    {
+        let handle = crate::runtime::Handle::current();
+        let driver_handle = handle.inner.driver().io();
+        if driver_handle.check_and_init()? {
+            return read_uring(&path).await;
+        }
+    }
+
     asyncify(move || std::fs::read(path)).await
+}
+
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring",
+    feature = "rt",
+    feature = "fs",
+    target_os = "linux"
+))]
+async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
+    use crate::{fs::OpenOptions, runtime::driver::op::Op};
+    use std::os::fd::OwnedFd;
+
+    let file = OpenOptions::new().read(true).open(path).await?;
+
+    let size = file.metadata().await.map(|m| m.len() as usize).ok();
+    let buf = Vec::with_capacity(size.unwrap_or(0));
+
+    let fd: OwnedFd = file
+        .try_into_std()
+        .expect("unexpected in-flight operation detected")
+        .into();
+
+    let (_res, buf) = Op::read(fd, buf)?.await?;
+
+    Ok(buf)
 }
