@@ -77,15 +77,26 @@ async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
 
     let file = OpenOptions::new().read(true).open(path).await?;
 
-    let size = file.metadata().await.map(|m| m.len() as usize).ok();
-    let buf = Vec::with_capacity(size.unwrap_or(0));
+    let size = file
+        .metadata()
+        .await
+        .map(|m| m.len() as usize)
+        .ok()
+        .unwrap_or(0);
+
+    let buf = Vec::with_capacity(size);
 
     let fd: OwnedFd = file
         .try_into_std()
         .expect("unexpected in-flight operation detected")
         .into();
 
-    let (_res, buf) = Op::read(fd, buf)?.await?;
+    let (read_size, mut buf) = Op::read(fd, buf)?.await?;
+
+    // SAFETY:
+    // 1. The buffer is initialized with `size` capacity
+    // 2. the read_size is the number of bytes read from the file
+    unsafe { buf.set_len(read_size as _) };
 
     Ok(buf)
 }
