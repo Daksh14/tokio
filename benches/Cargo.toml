@@ -20,6 +20,7 @@ tokio-stream = { version = "0.1", path = "../tokio-stream" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.42"
+tempfile = "3.1.0"
 
 [[bench]]
 name = "spawn"
@@ -94,6 +95,11 @@ harness = false
 [[bench]]
 name = "time_timeout"
 path = "time_timeout.rs"
+harness = false
+
+[[bench]]
+name = "io_uring_read"
+path = "io_uring_read.rs"
 harness = false
 
 [lints]
