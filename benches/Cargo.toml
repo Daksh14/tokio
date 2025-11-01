@@ -9,7 +9,7 @@ license = "MIT"
 test-util = ["tokio/test-util"]
 
 [dependencies]
-tokio = { version = "1.5.0", path = "../tokio", features = ["full"] }
+tokio = { version = "1.5.0", path = "../tokio", features = ["full", "io-uring"] }
 criterion = "0.5.1"
 rand = "0.9"
 rand_chacha = "0.9"

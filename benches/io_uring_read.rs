@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(tokio_unstable, target_os = "linux"))]
 
 use tempfile::NamedTempFile;
 
@@ -14,6 +14,7 @@ use std::io::Write;
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        .enable_io()
         .build()
         .unwrap()
 }
