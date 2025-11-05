@@ -3,10 +3,9 @@ use crate::io::uring::read::Read;
 use crate::io::uring::write::Write;
 use crate::runtime::Handle;
 
-use io_uring::cqueue;
-use io_uring::squeue::Entry;
+use io_uring::{cqueue, squeue};
 use std::future::Future;
-use std::io::{self, Error};
+use std::io::{self};
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -44,10 +43,10 @@ pub(crate) enum Lifecycle {
 
 pub(crate) enum State {
     // Single operation state
-    Initialize(Option<Entry>),
+    Initialize(Option<squeue::Entry>),
     Polled(usize),
     // Batch operation state
-    InitalizeBatch(Vec<Entry>),
+    InitalizeBatch(Vec<squeue::Entry>),
     PolledBatch(Vec<usize>),
     // Batch or single operation is completed
     Complete,
@@ -63,7 +62,7 @@ pub(crate) struct Op<T: Cancellable> {
     // indexes of slab of registered operation
     indexes: Vec<usize>,
     // Completed CQEs stored for checking batch completion
-    completed: Vec<CqeResult>,
+    completed: Vec<io::Result<u32>>,
 }
 
 impl<T: Cancellable> Op<T> {
@@ -71,7 +70,7 @@ impl<T: Cancellable> Op<T> {
     ///
     /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
-    pub(crate) unsafe fn new(entry: Entry, data: T) -> Self {
+    pub(crate) unsafe fn new(entry: squeue::Entry, data: T) -> Self {
         let handle = Handle::current();
 
         Self {
@@ -83,7 +82,7 @@ impl<T: Cancellable> Op<T> {
         }
     }
 
-    pub(crate) unsafe fn batch(entries: Vec<Entry>, data: T) -> Self {
+    pub(crate) unsafe fn batch(entries: Vec<squeue::Entry>, data: T) -> Self {
         let handle = Handle::current();
 
         Self {
@@ -127,37 +126,26 @@ impl<T: Cancellable> Drop for Op<T> {
     }
 }
 
-/// A single CQE result
-pub(crate) struct CqeResult {
-    pub(crate) result: io::Result<u32>,
+/// Result of an completed operation
+pub(crate) enum CqeResult {
+    Single(io::Result<u32>),
+    Batch(Vec<io::Result<u32>>),
+    // This is used when you want to terminate an operation with an error.
+    InitErr(io::Error),
 }
 
 impl From<cqueue::Entry> for CqeResult {
     fn from(cqe: cqueue::Entry) -> Self {
-        let res = cqe.result();
-        let result = if res >= 0 {
-            Ok(res as u32)
-        } else {
-            Err(io::Error::from_raw_os_error(-res))
-        };
-        CqeResult { result }
+        CqeResult::Single(cqe_to_result(cqe))
     }
 }
 
 /// A trait that converts a CQE result into a usable value for each operation.
 pub(crate) trait Completable {
     type Output;
-    // Called when a single operation is completed with single CQE
-    fn complete(self, cqe: CqeResult) -> Self::Output;
 
-    // Called when a batch operation is completed with multiple CQEs
-    fn complete_batch(self, cqes: Vec<CqeResult>) -> Self::Output;
-
-    // This is used when you want to terminate an operation with an error.
-    //
-    // The `Op` type that implements this trait can return the passed error
-    // upstream by embedding it in the `Output`.
-    fn complete_with_error(self, error: Error) -> Self::Output;
+    // Called when a single or batch operation is completed
+    fn complete(self, res: CqeResult) -> Self::Output;
 }
 
 /// Extracts the `CancelData` needed to safely cancel an in-flight io_uring operation.
@@ -190,7 +178,7 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
 
                         this.state = State::Complete;
 
-                        return Poll::Ready(data.complete_with_error(err));
+                        return Poll::Ready(data.complete(CqeResult::InitErr(err)));
                     }
                 };
 
@@ -213,7 +201,7 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
 
                         this.state = State::Complete;
 
-                        return Poll::Ready(data.complete_with_error(err));
+                        return Poll::Ready(data.complete(CqeResult::InitErr(err)));
                     }
                 };
 
@@ -225,7 +213,11 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                 let completed = &mut this.completed;
 
                 for idx in ids.iter() {
-                    let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
+                    let lifecycle = if let Some(lifecycle) = ctx.ops.get_mut(*idx) {
+                        lifecycle
+                    } else {
+                        continue;
+                    };
 
                     match mem::replace(lifecycle, Lifecycle::Submitted) {
                         // Only replace the stored waker if it wouldn't wake the new one
@@ -241,7 +233,7 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                         Lifecycle::Completed(cqe) => {
                             // Clean up and complete the future
                             ctx.remove_op(*idx);
-                            completed.push(cqe.into());
+                            completed.push(cqe_to_result(cqe));
                         }
 
                         Lifecycle::Submitted => {
@@ -265,7 +257,7 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                         .take_data()
                         .expect("Data must be present on completion");
 
-                    return Poll::Ready(data.complete_batch(completed));
+                    return Poll::Ready(data.complete(CqeResult::Batch(completed)));
                 }
 
                 Poll::Pending
@@ -316,5 +308,14 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
                 panic!("Future polled after completion");
             }
         }
+    }
+}
+
+fn cqe_to_result(cqe: cqueue::Entry) -> io::Result<u32> {
+    let res = cqe.result();
+    if res >= 0 {
+        Ok(res as u32)
+    } else {
+        Err(io::Error::from_raw_os_error(-res))
     }
 }
