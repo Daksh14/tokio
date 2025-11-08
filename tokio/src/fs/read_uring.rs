@@ -27,7 +27,7 @@ pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
         .into();
 
     // extra single capacity for the whole size to fit without any reallocation
-    let buf = Vec::with_capacity(0);
+    let buf = Vec::with_capacity(size_hint.unwrap_or(0));
 
     read_to_end_uring(size_hint, fd, buf).await
 }
