@@ -12,8 +12,9 @@ const PROBE_SIZE: usize = 32;
 const PROBE_SIZE_U32: u32 = PROBE_SIZE as u32;
 
 // Max bytes we can read using io uring submission at a time
+// Currently set to block size of 64
 // SAFETY: cannot be higher than u32::MAX for safe cast
-const MAX_READ_SIZE: usize = u32::MAX as usize;
+const MAX_READ_SIZE: usize = 64 * 1024 * 1024;
 
 pub(crate) async fn read_uring(path: &Path) -> io::Result<Vec<u8>> {
     let file = OpenOptions::new().read(true).open(path).await?;
@@ -55,7 +56,7 @@ async fn read_to_end_uring(
     }
 
     loop {
-        if buf.len() == buf.capacity() && buf.capacity() == start_cap && buf.len() > PROBE_SIZE {
+        if buf.len() == buf.capacity() && buf.capacity() == start_cap {
             // The buffer might be an exact fit. Let's read into a probe buffer
             // and see if it returns `Ok(0)`. If so, we've avoided an
             // unnecessary increasing of the capacity. But if not, append the
@@ -87,33 +88,18 @@ async fn read_to_end_uring(
         // is u32::MAX
         let mut read_len = buf_len as u32;
 
-        loop {
-            // read into spare capacity
-            let (res, r_fd, r_buf) = Op::read(fd, buf, read_len, offset).await;
+        // read into spare capacity
+        let res = op_read(fd, buf, read_len, offset).await;
 
-            match res {
-                Ok(0) => return Ok(r_buf),
-                Ok(size_read) => {
-                    fd = r_fd;
-                    buf = r_buf;
-                    offset += size_read as u64;
-                    read_len -= size_read;
-
-                    // keep reading if there's something left to be read
-                    if read_len > 0 {
-                        continue;
-                    } else {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {
-                    buf = r_buf;
-                    fd = r_fd;
-
-                    continue;
-                }
-                Err(e) => return Err(e),
+        match res {
+            Ok((Ok(0), _, r_buf)) => return Ok(r_buf),
+            Ok((Ok(size_read), r_fd, r_buf)) => {
+                fd = r_fd;
+                buf = r_buf;
+                offset += size_read as u64;
+                read_len -= size_read;
             }
+            Ok((Err(e), _, _)) | Err(e) => return Err(e),
         }
     }
 }
@@ -140,28 +126,39 @@ async fn small_probe_read(
         buf.reserve_exact(PROBE_SIZE);
     }
 
+    let res = op_read(fd, buf, PROBE_SIZE_U32, offset).await;
+
+    match res {
+        // return early if we inserted into reserved PROBE_SIZE
+        // bytes
+        Ok((Ok(size_read), r_fd, r_buf)) if !has_enough => Ok((size_read, r_fd, r_buf)),
+        Ok((Ok(size_read), r_fd, mut r_buf)) => {
+            let old_len = r_buf.len() - (size_read as usize);
+
+            r_buf.splice(old_len..old_len, temp_arr);
+
+            Ok((size_read, r_fd, r_buf))
+        }
+        Ok((Err(e), _, _)) | Err(e) => Err(e),
+    }
+}
+
+async fn op_read(
+    mut fd: OwnedFd,
+    mut buf: Vec<u8>,
+    len: u32,
+    offset: u64,
+) -> io::Result<(io::Result<u32>, OwnedFd, Vec<u8>)> {
     loop {
-        let (res, r_fd, mut r_buf) = Op::read(fd, buf, PROBE_SIZE_U32, offset).await;
+        let (res, r_fd, r_buf) = Op::read(fd, buf, len, offset).await;
 
         match res {
-            // return early if we inserted into reserved PROBE_SIZE
-            // bytes
-            Ok(size_read) if !has_enough => return Ok((size_read, r_fd, r_buf)),
-            Ok(size_read) => {
-                let size_read_usize = size_read as usize;
-                let old_len = r_buf.len() - size_read_usize;
-
-                r_buf.splice(old_len..old_len, temp_arr);
-
-                return Ok((size_read, r_fd, r_buf));
-            }
             Err(e) if e.kind() == ErrorKind::Interrupted => {
                 buf = r_buf;
                 fd = r_fd;
-
-                continue;
             }
             Err(e) => return Err(e),
+            _ => return Ok((res, r_fd, r_buf)),
         }
     }
 }

@@ -8,12 +8,12 @@ use criterion::{criterion_group, criterion_main, Criterion};
 
 use std::io::Write;
 
-const BUFFER_SIZE: usize = 5000;
+const BUFFER_SIZE: usize = 1024 * 1024 * 1024 * 1 + (1024 * 1024);
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
         .enable_io()
+        .enable_io_uring()
         .build()
         .unwrap()
 }
@@ -21,7 +21,7 @@ fn rt() -> tokio::runtime::Runtime {
 fn temp_file() -> NamedTempFile {
     let mut file = tempfile::Builder::new().tempfile().unwrap();
 
-    let buffer = [0u8; BUFFER_SIZE];
+    let buffer = vec![0u8; BUFFER_SIZE];
 
     file.write_all(&buffer).unwrap();
 
@@ -33,6 +33,10 @@ fn async_read_file_io_uring(c: &mut Criterion) {
     let rt = rt();
 
     let file_ref = std::sync::Arc::new(temp_file());
+    // enable io_uring
+    rt.block_on(async {
+        let _ = read(file_ref.clone().as_ref()).await.unwrap();
+    });
 
     c.bench_function("async_read_file_io_uring", |b| {
         let file = file_ref.clone();
@@ -40,11 +44,18 @@ fn async_read_file_io_uring(c: &mut Criterion) {
         b.iter(|| {
             let file = file.clone();
 
-            let task = || async {
+            rt.block_on(async {
                 let _bytes = read(file.as_ref()).await.unwrap();
-            };
+            })
+        })
+    });
 
-            rt.block_on(task());
+    c.bench_function("sync_read", |b| {
+        let file_ref = file_ref.clone();
+
+        b.iter(|| {
+            let file_ref = file_ref.clone();
+            let _read = std::fs::read(file_ref.as_ref());
         })
     });
 }
@@ -70,23 +81,10 @@ fn async_read_file_normal(c: &mut Criterion) {
     });
 }
 
-fn sync_read(c: &mut Criterion) {
-    let file_ref = std::sync::Arc::new(temp_file());
-
-    c.bench_function("sync_read", |b| {
-        let file_ref = file_ref.clone();
-
-        b.iter(|| {
-            let file_ref = file_ref.clone();
-            let _read = std::fs::read(file_ref.as_ref());
-        })
-    });
-}
-
 #[cfg(all(tokio_unstable, target_os = "linux"))]
-criterion_group!(file, async_read_file_io_uring, sync_read,);
+criterion_group!(file, async_read_file_io_uring,);
 
 #[cfg(not(tokio_unstable))]
-criterion_group!(file, sync_read, async_read_file_normal);
+criterion_group!(file, async_read_file_normal);
 
 criterion_main!(file);
