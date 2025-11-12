@@ -51,6 +51,8 @@ fn shutdown_runtime_while_performing_io_uring_ops() {
     fn run(rt: Runtime) {
         let (done_tx, done_rx) = mpsc::channel();
         let (_tmp, path) = create_tmp_files(1);
+        // keep 100 permits
+        const N: i32 = 100;
         rt.spawn(async move {
             let path = path[0].clone();
 
