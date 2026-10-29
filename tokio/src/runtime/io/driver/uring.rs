@@ -230,10 +230,7 @@ impl Handle {
         entry: Entry,
         waker: &Waker,
     ) -> Result<Arc<Lifecycle>, Entry> {
-        let ctx = self
-            .uring_context
-            .get()
-            .expect("io_uring not initialized");
+        let ctx = self.uring_context.get().expect("io_uring not initialized");
 
         let lifecycle = Arc::new(Lifecycle::new(waker));
         // The kernel's reference, reclaimed when the CQE arrives.
@@ -302,8 +299,7 @@ impl Handle {
                 ctx.dispatch_completions();
 
                 // Left behind by `EAGAIN` or a partial submit: come back next turn.
-                if ctx.has_pending_submissions()
-                    && !mem::replace(&mut ctx.sq.lock().notified, true)
+                if ctx.has_pending_submissions() && !mem::replace(&mut ctx.sq.lock().notified, true)
                 {
                     self.unpark();
                 }

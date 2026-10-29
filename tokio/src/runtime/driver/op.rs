@@ -107,7 +107,8 @@ impl Lifecycle {
     /// when the `Op` is dropped.
     pub(crate) fn cancel(&self, data: CancelData) {
         // SAFETY: the driver reads `cancel_data` only after it sees `CANCELLED`.
-        self.cancel_data.with_mut(|ptr| unsafe { *ptr = Some(data) });
+        self.cancel_data
+            .with_mut(|ptr| unsafe { *ptr = Some(data) });
         if self
             .state
             .compare_exchange(PENDING, CANCELLED, AcqRel, Acquire)
