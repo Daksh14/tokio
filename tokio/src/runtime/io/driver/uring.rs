@@ -1,64 +1,44 @@
 use io_uring::{squeue::Entry, IoUring, Probe};
 use mio::unix::SourceFd;
-use slab::Slab;
 
-use crate::runtime::driver::op::CancelData;
-use crate::runtime::driver::op::CqeResult;
-use crate::runtime::driver::op::{Cancellable, Lifecycle};
-use crate::{io::Interest, loom::sync::Mutex};
+use crate::io::Interest;
+use crate::loom::sync::atomic::AtomicUsize;
+use crate::loom::sync::Mutex;
+use crate::runtime::driver::op::Lifecycle;
 
 use super::{Handle, TOKEN_WAKEUP};
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 use std::{io, mem, task::Waker};
 
 const DEFAULT_RING_SIZE: u32 = 256;
 
-/// Outcome of registering an op with the io_uring.
-pub(crate) enum RegisterResult {
-    /// In-flight at this slab index.
-    Submitted(usize),
-
-    /// Submit failed before reaching the kernel; the slot was removed.
-    NotPushed(io::Error),
-
-    /// Submit failed after reaching the kernel; the slot is kept and the caller
-    /// must cancel it to keep its resources alive until completion.
-    Pushed { index: usize, error: io::Error },
+/// Tasks push entries straight into the submission queue under `sq`, which is
+/// held only to copy an entry in and publish the tail. Everything else belongs
+/// to the driver: it is the only caller of `io_uring_enter` and the only
+/// consumer of the completion queue, and each op's result goes back through
+/// its own [`Lifecycle`].
+pub(crate) struct UringContext {
+    uring: IoUring,
+    /// Guards every submission queue view.
+    sq: Mutex<SqState>,
+    /// Entries pushed onto the submission queue whose CQE hasn't arrived yet.
+    in_flight: AtomicUsize,
 }
 
-pub(crate) struct UringContext {
-    pub(crate) uring: Option<io_uring::IoUring>,
-    pub(crate) ops: slab::Slab<Lifecycle>,
+struct SqState {
+    /// Whether the driver has been woken for entries pushed since its last submit.
+    notified: bool,
 }
 
 impl UringContext {
-    pub(crate) fn new() -> Self {
-        Self {
-            ops: Slab::new(),
-            uring: None,
-        }
-    }
-
-    pub(crate) fn ring(&self) -> &io_uring::IoUring {
-        self.uring.as_ref().expect("io_uring not initialized")
-    }
-
-    pub(crate) fn ring_mut(&mut self) -> &mut io_uring::IoUring {
-        self.uring.as_mut().expect("io_uring not initialized")
-    }
-
-    /// Perform `io_uring_setup` system call, and Returns true if this
-    /// actually initialized the io_uring.
+    /// Perform the `io_uring_setup` system call.
     ///
     /// If the machine doesn't support io_uring, then this will return an
     /// `ENOSYS` error.
-    pub(crate) fn try_init(&mut self, probe: &mut Probe) -> io::Result<bool> {
-        if self.uring.is_some() {
-            // Already initialized.
-            return Ok(false);
-        }
-
+    fn new(probe: &mut Probe) -> io::Result<Self> {
         let uring = IoUring::new(DEFAULT_RING_SIZE)?;
 
         match uring.submitter().register_probe(probe) {
@@ -70,121 +50,92 @@ impl UringContext {
             Err(e) => return Err(e),
         }
 
-        self.uring.replace(uring);
-
-        Ok(true)
+        Ok(Self {
+            uring,
+            sq: Mutex::new(SqState { notified: false }),
+            in_flight: AtomicUsize::new(0),
+        })
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
-        let ops = &mut self.ops;
-        let Some(uring) = self.uring.as_mut() else {
-            // Uring is not initialized yet.
-            return;
-        };
+    /// Returns whether the submission queue holds entries the kernel hasn't
+    /// consumed yet.
+    fn has_pending_submissions(&self) -> bool {
+        let _state = self.sq.lock();
+        // SAFETY: submission queue views are only created while `sq` is held.
+        !unsafe { self.uring.submission_shared() }.is_empty()
+    }
 
-        let cq = uring.completion();
+    fn cq_overflow(&self) -> bool {
+        let _state = self.sq.lock();
+        // SAFETY: submission queue views are only created while `sq` is held.
+        unsafe { self.uring.submission_shared() }.cq_overflow()
+    }
+
+    /// # Safety
+    ///
+    /// Only the driver may call this: it is the only consumer of the
+    /// completion queue.
+    unsafe fn dispatch_completions(&self) {
+        // SAFETY: the caller is the only consumer of the completion queue.
+        let cq = unsafe { self.uring.completion_shared() };
 
         for cqe in cq {
-            let idx = cqe.user_data() as usize;
-
-            match ops.get_mut(idx) {
-                Some(lifecycle @ Lifecycle::Waiting(_)) => {
-                    let Lifecycle::Waiting(waker) =
-                        mem::replace(lifecycle, Lifecycle::Completed(cqe))
-                    else {
-                        unreachable!()
-                    };
-                    waker.wake_by_ref();
-                }
-                Some(Lifecycle::Cancelled(cancel_data)) => {
-                    if let CancelData::Open(_) = cancel_data {
-                        if let Ok(fd) = CqeResult::from(cqe).result {
-                            // SAFETY: the successful CQE result provides
-                            // a non-negative integer, and the event is
-                            // related to an open operation.
-                            unsafe { OwnedFd::from_raw_fd(fd as i32) };
-                        }
-                    }
-                    // Op future was cancelled, so we discard the result.
-                    ops.remove(idx);
-                }
-                Some(other) => {
-                    panic!("unexpected lifecycle for slot {idx}: {other:?}");
-                }
-                None => {
-                    panic!("no op at index {idx}");
-                }
-            }
+            // SAFETY: `register_op` stored an `Arc::into_raw` pointer in
+            // `user_data`, and the kernel posts exactly one CQE per entry.
+            let lifecycle = unsafe { Arc::from_raw(cqe.user_data() as *const Lifecycle) };
+            // Account for the CQE before waking: a panicking waker must not
+            // leave `in_flight` counting an op whose CQE is already consumed.
+            self.in_flight.fetch_sub(1, Relaxed);
+            lifecycle.complete(cqe.result());
         }
 
-        // `cq`'s drop gets called here, updating the latest head pointer
+        // `cq`'s drop gets called here (also on unwind), updating the latest head pointer
     }
 
-    pub(crate) fn submit(&mut self) -> io::Result<()> {
+    /// Submits every entry published so far.
+    ///
+    /// No lock is needed: `Submitter::submit` only reads the submission queue
+    /// head and tail atomically, and the kernel takes whatever has been
+    /// published.
+    ///
+    /// # Safety
+    ///
+    /// Only the driver may call this.
+    unsafe fn submit(&self) -> io::Result<()> {
         loop {
             // Errors from io_uring_enter: https://man7.org/linux/man-pages/man2/io_uring_enter.2.html#ERRORS
-            match self.ring().submit() {
-                Ok(_) => {
-                    if self.ring_mut().submission().is_empty() {
-                        return Ok(());
-                    }
-                }
-
-                // If the submission queue is full, we dispatch completions and try again.
+            match self.uring.submit() {
+                Ok(_) => return Ok(()),
+                // If the completion queue is overflowing, we dispatch completions and try again.
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.dispatch_completions();
+                    // SAFETY: the caller is the driver.
+                    unsafe { self.dispatch_completions() };
                 }
                 Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => {}
                 // For other errors, we currently return the error as is.
-                Err(e) => {
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
     }
-
-    pub(crate) fn remove_op(&mut self, index: usize) -> Lifecycle {
-        self.ops.remove(index)
-    }
 }
 
-/// Drop the driver, cancelling any in-progress ops and waiting for them to terminate.
+/// Drop the driver, waiting for in-progress ops to terminate.
 impl Drop for UringContext {
     fn drop(&mut self) {
-        if self.uring.is_none() {
-            // Uring is not initialized or not supported.
-            return;
-        }
-
-        // Make sure we flush the submission queue before dropping the driver.
-        if !self.ring_mut().submission().is_empty() {
-            self.submit().expect("Internal error when dropping driver");
-        }
-
-        let mut ops = std::mem::take(&mut self.ops);
-
-        // Remove all completed ops since we don't need to wait for them.
-        ops.retain(|_, lifecycle| !matches!(lifecycle, Lifecycle::Completed(_)));
-
-        while !ops.is_empty() {
-            // Wait until at least one completion is available.
-            self.ring_mut()
+        // Every `Op` holds a runtime handle, so by now all ops still in flight
+        // were cancelled. Wait for their CQEs so the kernel is done with their
+        // resources before they are freed. This also submits anything still
+        // sitting in the submission queue.
+        while self.in_flight.load(Relaxed) > 0 {
+            self.uring
                 .submit_and_wait(1)
                 .expect("Internal error when dropping driver");
 
-            for cqe in self.ring_mut().completion() {
-                let idx = cqe.user_data() as usize;
-
-                if let Some(Lifecycle::Cancelled(CancelData::Open(_))) = ops.get_mut(idx) {
-                    if let Ok(fd) = CqeResult::from(cqe).result {
-                        // SAFETY: the successful CQE result provides
-                        // a non-negative integer, and the event is
-                        // related to an open operation.
-                        unsafe { OwnedFd::from_raw_fd(fd as i32) };
-                    }
-                };
-
-                ops.remove(idx);
+            for cqe in self.uring.completion() {
+                // SAFETY: as in `dispatch_completions`.
+                let lifecycle = unsafe { Arc::from_raw(cqe.user_data() as *const Lifecycle) };
+                self.in_flight.fetch_sub(1, Relaxed);
+                lifecycle.complete(cqe.result());
             }
         }
     }
@@ -195,10 +146,6 @@ impl Handle {
         let mut source = SourceFd(&uringfd);
         self.registry
             .register(&mut source, TOKEN_WAKEUP, Interest::READABLE.to_mio())
-    }
-
-    pub(crate) fn get_uring(&self) -> &Mutex<UringContext> {
-        &self.uring_context
     }
 
     /// Returns `true` if io_uring has already been initialized and the given
@@ -257,101 +204,119 @@ impl Handle {
             .is_some_and(|probe| probe.is_supported(opcode)))
     }
 
-    /// Initialize the io_uring context if it hasn't been initialized yet.
+    /// Initialize the io_uring context.
     fn try_init(&self, probe: &mut Probe) -> io::Result<()> {
-        let mut guard = self.get_uring().lock();
-        if guard.try_init(probe)? {
-            self.add_uring_source(guard.ring().as_raw_fd())?;
-        }
+        let ctx = UringContext::new(probe)?;
+        self.add_uring_source(ctx.uring.as_raw_fd())?;
+        // `check_and_init` runs this at most once at a time, and only until it
+        // succeeds, so the cell is still empty.
+        let _ = self.uring_context.set(ctx);
 
         Ok(())
     }
 
-    /// Register an operation with the io_uring.
+    /// Push an operation onto the io_uring submission queue. The driver
+    /// submits it on its next turn.
     ///
-    /// If this is the first io_uring operation, it will also initialize the io_uring context.
-    /// If io_uring isn't supported, this function returns an `ENOSYS` error, so the caller can
-    /// perform custom handling, such as falling back to an alternative mechanism.
+    /// Hands the entry back if the submission queue is full; the caller should
+    /// retry once the driver has run.
     ///
     /// # Safety
     ///
     /// Callers must ensure that parameters of the entry (such as buffer) are valid and will
     /// be valid for the entire duration of the operation, otherwise it may cause memory problems.
-    pub(crate) unsafe fn register_op(&self, entry: Entry, waker: Waker) -> RegisterResult {
-        assert!(self.uring_probe.initialized());
+    pub(crate) unsafe fn register_op(
+        &self,
+        entry: Entry,
+        waker: &Waker,
+    ) -> Result<Arc<Lifecycle>, Entry> {
+        let ctx = self
+            .uring_context
+            .get()
+            .expect("io_uring not initialized");
 
-        // Uring is initialized.
+        let lifecycle = Arc::new(Lifecycle::new(waker));
+        // The kernel's reference, reclaimed when the CQE arrives.
+        let ptr = Arc::into_raw(lifecycle.clone());
+        let entry = entry.user_data(ptr as u64);
 
-        let mut guard = self.get_uring().lock();
-        let ctx = &mut *guard;
-        let index = ctx.ops.insert(Lifecycle::Waiting(waker));
-        let entry = entry.user_data(index as u64);
+        {
+            let mut state = ctx.sq.lock();
+            // SAFETY: submission queue views are only created while `sq` is held.
+            let mut sq = unsafe { ctx.uring.submission_shared() };
 
-        // `entry` has not been pushed yet, so a submit error here means it never
-        // reached the kernel and we can drop the slot before returning.
-        let submit_before_push = |ctx: &mut UringContext| -> io::Result<()> {
-            if let Err(e) = ctx.submit() {
-                ctx.remove_op(index);
-                return Err(e);
+            // SAFETY: entry is valid for the entire duration of the operation
+            if unsafe { sq.push(&entry) }.is_err() {
+                // The submission queue is full: take the kernel's reference back.
+                // SAFETY: `ptr` came from `Arc::into_raw` above and the kernel never saw it.
+                drop(unsafe { Arc::from_raw(ptr) });
+                return Err(entry);
             }
-            Ok(())
-        };
 
-        // SAFETY: entry is valid for the entire duration of the operation
-        while unsafe { ctx.ring_mut().submission().push(&entry).is_err() } {
-            // If the submission queue is full, flush it to the kernel and retry.
-            if let Err(e) = submit_before_push(ctx) {
-                return RegisterResult::NotPushed(e);
+            // Counted before the tail is published, so the CQE can't come first.
+            ctx.in_flight.fetch_add(1, Relaxed);
+
+            // Publishes the new tail while `sq` is still held.
+            drop(sq);
+
+            if mem::replace(&mut state.notified, true) {
+                return Ok(lifecycle);
             }
         }
 
-        // Ensure that the completion queue is not full before submitting the entry.
-        while ctx.ring_mut().completion().is_full() {
-            ctx.dispatch_completions();
-        }
+        // First push since the driver's last submit.
+        self.unpark();
 
-        // Note: For now, we submit the entry immediately without utilizing batching.
-        //
-        // `entry` is now pushed, so the kernel may already own the buffer it
-        // points at. Keep the slot on a submit error: dropping it would let the
-        // `Op` free the buffer while it is still in use.
-        if let Err(e) = ctx.submit() {
-            return RegisterResult::Pushed { index, error: e };
-        }
-
-        RegisterResult::Submitted(index)
+        Ok(lifecycle)
     }
 
-    pub(crate) fn cancel_op<T: Cancellable>(&self, index: usize, data: Option<T>) {
-        let mut guard = self.get_uring().lock();
-        let ctx = &mut *guard;
-        let ops = &mut ctx.ops;
-        let Some(lifecycle) = ops.get_mut(index) else {
-            // The corresponding index doesn't exist anymore, so this Op is already complete.
+    /// Submits pushed entries and dispatches completions.
+    ///
+    /// # Safety
+    ///
+    /// Only `Driver::turn` may call this: the driver is the only caller of
+    /// `io_uring_enter` and the only consumer of the completion queue.
+    pub(super) unsafe fn turn_uring(&self) {
+        let Some(ctx) = self.uring_context.get() else {
+            // Uring is not initialized yet.
             return;
         };
 
-        // This Op will be cancelled. Here, we don't remove the lifecycle from the slab to keep
-        // uring data alive until the operation completes.
+        // SAFETY: the caller is the driver.
+        unsafe {
+            // Free up completion queue space before submitting more.
+            ctx.dispatch_completions();
 
-        let cancel_data = data.expect("Data should be present").cancel();
-        match mem::replace(lifecycle, Lifecycle::Cancelled(cancel_data)) {
-            Lifecycle::Submitted | Lifecycle::Waiting(_) => (),
-            // The driver saw the completion, but it was never polled.
-            Lifecycle::Completed(cqe) => {
-                if let Lifecycle::Cancelled(CancelData::Open(_)) = lifecycle {
-                    if let Ok(fd) = CqeResult::from(cqe).result {
-                        // SAFETY: the successful CQE result provides
-                        // a non-negative integer, and the event is
-                        // related to an open operation.
-                        unsafe { OwnedFd::from_raw_fd(fd as i32) };
-                    }
+            // Entries pushed from here on wake the driver again.
+            mem::take(&mut ctx.sq.lock().notified);
+
+            if ctx.has_pending_submissions() {
+                match ctx.submit() {
+                    Ok(()) => {}
+                    // The kernel is out of resources: the entries stay queued.
+                    Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {}
+                    Err(e) => panic!("unexpected error when submitting io_uring entries: {e}"),
                 }
-                // We can safely remove the entry from the slab, as it has already been completed.
-                ops.remove(index);
+
+                // Entries that completed inline during submission.
+                ctx.dispatch_completions();
+
+                // Left behind by `EAGAIN` or a partial submit: come back next turn.
+                if ctx.has_pending_submissions()
+                    && !mem::replace(&mut ctx.sq.lock().notified, true)
+                {
+                    self.unpark();
+                }
             }
-            prev => panic!("Unexpected state: {prev:?}"),
-        };
+
+            // There might be some cases where the CQ overflows, so we need to flush
+            // the remaining buffered CQEs.
+            while ctx.cq_overflow() {
+                ctx.submit()
+                    .expect("failed to flush io_uring completion queue overflow");
+                ctx.dispatch_completions();
+            }
+        }
     }
 }
 

@@ -4,7 +4,7 @@ use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult
 
 use io_uring::{opcode, types};
 use std::fmt;
-use std::io::{self, Error};
+use std::io;
 use std::os::fd::OwnedFd;
 
 /// Trait for buffers that can be used with io-uring read operations.
@@ -73,14 +73,6 @@ impl<B: ReadBuffer, F: UringFd> Completable for Read<B, F> {
             unsafe { buf.uring_read_complete(len) };
         }
         (cqe.result, Some(self.fd), Some(buf))
-    }
-
-    fn complete_with_error(self, err: Error) -> Self::Output {
-        (Err(err), Some(self.fd), Some(self.buf))
-    }
-
-    fn complete_after_cancel(err: Error) -> Self::Output {
-        (Err(err), None, None)
     }
 }
 

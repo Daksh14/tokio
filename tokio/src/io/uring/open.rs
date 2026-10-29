@@ -5,7 +5,7 @@ use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult
 
 use io_uring::{opcode, types};
 use std::ffi::CString;
-use std::io::{self, Error};
+use std::io;
 use std::os::fd::FromRawFd;
 use std::path::Path;
 
@@ -17,29 +17,11 @@ pub(crate) struct Open {
     path: CString,
 }
 
-/// Distinguishes whether an `Interrupted` error allows retrying the open operation.
-#[derive(Debug)]
-pub(crate) enum OpenError {
-    /// A submission error: return it without retrying, even for `Interrupted`.
-    Submission(io::Error),
-    /// An error reported by the CQE: retry only if it is `Interrupted`.
-    Completion(io::Error),
-}
-
 impl Completable for Open {
-    type Output = Result<crate::fs::File, OpenError>;
+    type Output = io::Result<crate::fs::File>;
     fn complete(self, cqe: CqeResult) -> Self::Output {
         cqe.result
             .map(|fd| unsafe { crate::fs::File::from_raw_fd(fd as i32) })
-            .map_err(OpenError::Completion)
-    }
-
-    fn complete_with_error(self, err: Error) -> Self::Output {
-        Err(OpenError::Submission(err))
-    }
-
-    fn complete_after_cancel(err: Error) -> Self::Output {
-        Err(OpenError::Submission(err))
     }
 }
 
@@ -76,8 +58,8 @@ pub(crate) async fn open(path: &Path, options: &UringOpenOptions) -> io::Result<
     loop {
         match Op::open(path, options)?.await {
             Ok(file) => return Ok(file),
-            Err(OpenError::Completion(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(OpenError::Completion(e) | OpenError::Submission(e)) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
 }
