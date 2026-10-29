@@ -5,8 +5,10 @@ use crate::io::uring::rename::Rename;
 use crate::io::uring::utils::ArcFd;
 use crate::io::uring::write::Write;
 
-use crate::runtime::io::RegisterResult;
+use crate::loom::cell::UnsafeCell;
+use crate::loom::sync::atomic::{AtomicU32, AtomicU8};
 use crate::runtime::Handle;
+use crate::sync::AtomicWaker;
 
 #[cfg(
     // libc::statx is only supported on these platforms
@@ -21,13 +23,13 @@ use crate::runtime::Handle;
     any(target_env = "gnu", target_os = "android")
 )]
 use crate::io::uring::statx::Statx;
-use io_uring::cqueue;
 use io_uring::squeue::Entry;
 use std::future::Future;
 use std::io;
-use std::mem;
-use std::os::fd::OwnedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 // This field isn't accessed directly, but it holds cancellation data,
@@ -55,29 +57,93 @@ pub(crate) enum CancelData {
     Statx(Statx),
 }
 
-#[derive(Debug)]
-pub(crate) enum Lifecycle {
-    /// The operation has been submitted to uring and is currently in-flight
-    Submitted,
+const PENDING: u8 = 0;
+const COMPLETED: u8 = 1;
+const CANCELLED: u8 = 2;
 
-    /// The submitter is waiting for the completion of the operation
-    Waiting(Waker),
+/// State an [`Op`] shares with the driver.
+///
+/// The driver holds a reference from when the entry is pushed onto the
+/// submission queue until its CQE arrives; `user_data` is that reference.
+pub(crate) struct Lifecycle {
+    state: AtomicU8,
+    /// The CQE result, valid once `state` is `COMPLETED`.
+    result: AtomicU32,
+    waker: AtomicWaker,
+    /// The op's resources, handed over when the `Op` is dropped before completing.
+    cancel_data: UnsafeCell<Option<CancelData>>,
+}
 
-    /// The submitter no longer has interest in the operation result. The state
-    /// must be passed to the driver and held until the operation completes.
-    Cancelled(
-        // This field isn't accessed directly, but it holds cancellation data,
-        // so `#[allow(dead_code)]` is needed.
-        #[allow(dead_code)] CancelData,
-    ),
+// SAFETY: the `Op` writes `cancel_data` before publishing `CANCELLED`, and only
+// the side that loses the race out of `PENDING` reads it afterwards.
+unsafe impl Sync for Lifecycle {}
 
-    /// The operation has completed with a single cqe result
-    Completed(cqueue::Entry),
+impl Lifecycle {
+    pub(crate) fn new(waker: &Waker) -> Self {
+        let lifecycle = Self {
+            state: AtomicU8::new(PENDING),
+            result: AtomicU32::new(0),
+            waker: AtomicWaker::new(),
+            cancel_data: UnsafeCell::new(None),
+        };
+        lifecycle.waker.register_by_ref(waker);
+        lifecycle
+    }
+
+    /// Records the CQE result. Called by the driver.
+    pub(crate) fn complete(&self, res: i32) {
+        self.result.store(res as u32, Relaxed);
+        match self
+            .state
+            .compare_exchange(PENDING, COMPLETED, AcqRel, Acquire)
+        {
+            Ok(_) => self.waker.wake(),
+            // The `Op` is gone, so its resources are released here.
+            Err(_) => self.release(res),
+        }
+    }
+
+    /// Hands the op's resources over while it may still be in flight. Called
+    /// when the `Op` is dropped.
+    pub(crate) fn cancel(&self, data: CancelData) {
+        // SAFETY: the driver reads `cancel_data` only after it sees `CANCELLED`.
+        self.cancel_data
+            .with_mut(|ptr| unsafe { *ptr = Some(data) });
+        if self
+            .state
+            .compare_exchange(PENDING, CANCELLED, AcqRel, Acquire)
+            .is_err()
+        {
+            // The CQE arrived but was never observed.
+            self.release(self.result.load(Relaxed) as i32);
+        }
+    }
+
+    pub(crate) fn poll(&self, cx: &mut Context<'_>) -> Poll<i32> {
+        if self.state.load(Acquire) != COMPLETED {
+            self.waker.register_by_ref(cx.waker());
+            // The CQE may have arrived before the new waker was registered.
+            if self.state.load(Acquire) != COMPLETED {
+                return Poll::Pending;
+            }
+        }
+        Poll::Ready(self.result.load(Relaxed) as i32)
+    }
+
+    /// Drops the resources of a cancelled op once the kernel is done with them.
+    fn release(&self, res: i32) {
+        // SAFETY: both sides have left `PENDING`, so this is the only access.
+        let data = self.cancel_data.with_mut(|ptr| unsafe { (*ptr).take() });
+        if matches!(data, Some(CancelData::Open(_))) && res >= 0 {
+            // SAFETY: a successful open CQE carries a new fd that nothing else owns.
+            drop(unsafe { OwnedFd::from_raw_fd(res) });
+        }
+    }
 }
 
 pub(crate) enum State {
     Initialize(Option<Entry>),
-    Polled(usize),
+    Polled(Arc<Lifecycle>),
     Complete,
 }
 
@@ -110,18 +176,11 @@ impl<T: Cancellable> Op<T> {
 
 impl<T: Cancellable> Drop for Op<T> {
     fn drop(&mut self) {
-        match self.state {
-            // We've already dropped this Op.
-            State::Complete => (),
-            // We will cancel this Op.
-            State::Polled(index) => {
-                let data = self.take_data();
-                let handle = &mut self.handle;
-                handle.inner.driver().io().cancel_op(index, data);
-            }
-            // This Op has not been polled yet.
-            // We don't need to do anything here.
-            State::Initialize(_) => (),
+        // A registered op that hasn't completed keeps its resources alive until
+        // the kernel is done with them.
+        if let State::Polled(lifecycle) = &self.state {
+            let data = self.data.take().expect("Data should be present");
+            lifecycle.cancel(data.cancel());
         }
     }
 }
@@ -131,9 +190,8 @@ pub(crate) struct CqeResult {
     pub(crate) result: io::Result<u32>,
 }
 
-impl From<cqueue::Entry> for CqeResult {
-    fn from(cqe: cqueue::Entry) -> Self {
-        let res = cqe.result();
+impl From<i32> for CqeResult {
+    fn from(res: i32) -> Self {
         let result = if res >= 0 {
             Ok(res as u32)
         } else {
@@ -147,16 +205,6 @@ impl From<cqueue::Entry> for CqeResult {
 pub(crate) trait Completable {
     type Output;
     fn complete(self, cqe: CqeResult) -> Self::Output;
-
-    // This is used when you want to terminate an operation with an error.
-    //
-    // The `Op` type that implements this trait can return the passed error
-    // upstream by embedding it in the `Output`.
-    fn complete_with_error(self, error: io::Error) -> Self::Output;
-
-    // Like `complete_with_error`, but for an op cancelled after the SQE reached
-    // the kernel: its resources stay with the driver and are not returned.
-    fn complete_after_cancel(error: io::Error) -> Self::Output;
 }
 
 /// Extracts the `CancelData` needed to safely cancel an in-flight io_uring operation.
@@ -175,85 +223,30 @@ impl<T: Cancellable + Completable + Send> Future for Op<T> {
         match &mut this.state {
             State::Initialize(entry_opt) => {
                 let entry = entry_opt.take().expect("Entry must be present");
-                let waker = cx.waker().clone();
-
                 let driver = this.handle.inner.driver().io();
+
                 // SAFETY: entry is valid for the entire duration of the operation
-                let result = unsafe { driver.register_op(entry, waker) };
-
-                match result {
-                    RegisterResult::Submitted(idx) => this.state = State::Polled(idx),
-
-                    // The kernel never saw the entry, so the resources go back to
-                    // the caller with the error.
-                    RegisterResult::NotPushed(err) => {
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on Initialization");
-
-                        this.state = State::Complete;
-
-                        return Poll::Ready(data.complete_with_error(err));
+                match unsafe { driver.register_op(entry, cx.waker()) } {
+                    Ok(lifecycle) => this.state = State::Polled(lifecycle),
+                    // The submission queue is full. Retry after the next park,
+                    // which turns the driver.
+                    Err(entry) => {
+                        *entry_opt = Some(entry);
+                        crate::runtime::context::defer(cx.waker());
                     }
-
-                    // The kernel may have seen the entry, so cancel to keep the
-                    // resources alive until completion instead of returning them.
-                    RegisterResult::Pushed { index, error } => {
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on Initialization");
-
-                        this.handle.inner.driver().io().cancel_op(index, Some(data));
-
-                        this.state = State::Complete;
-
-                        return Poll::Ready(T::complete_after_cancel(error));
-                    }
-                };
+                }
 
                 Poll::Pending
             }
 
-            State::Polled(idx) => {
-                let driver = this.handle.inner.driver().io();
-                let mut ctx = driver.get_uring().lock();
-                let lifecycle = ctx.ops.get_mut(*idx).expect("Lifecycle must be present");
+            State::Polled(lifecycle) => {
+                let res = std::task::ready!(lifecycle.poll(cx));
+                this.state = State::Complete;
 
-                match mem::replace(lifecycle, Lifecycle::Submitted) {
-                    // Only replace the stored waker if it wouldn't wake the new one
-                    Lifecycle::Waiting(prev) if !prev.will_wake(cx.waker()) => {
-                        let waker = cx.waker().clone();
-                        *lifecycle = Lifecycle::Waiting(waker);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Waiting(prev) => {
-                        *lifecycle = Lifecycle::Waiting(prev);
-                        Poll::Pending
-                    }
-
-                    Lifecycle::Completed(cqe) => {
-                        // Clean up and complete the future
-                        ctx.remove_op(*idx);
-
-                        this.state = State::Complete;
-
-                        drop(ctx);
-
-                        let data = this
-                            .take_data()
-                            .expect("Data must be present on completion");
-                        Poll::Ready(data.complete(cqe.into()))
-                    }
-
-                    Lifecycle::Submitted => {
-                        unreachable!("Submitted lifecycle should never be seen here");
-                    }
-
-                    Lifecycle::Cancelled(_) => {
-                        unreachable!("Cancelled lifecycle should never be seen here");
-                    }
-                }
+                let data = this
+                    .take_data()
+                    .expect("Data must be present on completion");
+                Poll::Ready(data.complete(res.into()))
             }
 
             State::Complete => {

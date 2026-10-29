@@ -1,9 +1,10 @@
 use super::super::{Driver, Handle};
-use super::RegisterResult;
-use crate::runtime::driver::op::Lifecycle;
+use super::DEFAULT_RING_SIZE;
 
 use io_uring::{opcode, Probe};
-use std::os::fd::AsRawFd;
+use std::sync::atomic::Ordering::Relaxed;
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 // Builds a driver whose io_uring context is initialized, or returns `None` when
 // io_uring is unavailable on the host.
@@ -11,72 +12,70 @@ fn ready_handle() -> Option<(Driver, Handle)> {
     let (driver, handle) = Driver::new(1024, None).ok()?;
 
     let mut probe = Probe::new();
-    {
-        let mut guard = handle.get_uring().lock();
-        if !guard.try_init(&mut probe).ok()? {
-            return None;
-        }
-    }
+    handle.try_init(&mut probe).ok()?;
     handle.uring_probe.set(Some(probe)).unwrap();
 
     Some((driver, handle))
 }
 
-// Makes the next submission fail with a non-`EBUSY` error by pointing the ring's
-// file descriptor at `/dev/null`, then restores it so the driver can shut down.
-struct BrokenRing {
-    ring_fd: i32,
-    saved: i32,
+fn in_flight(handle: &Handle) -> usize {
+    handle.uring_context.get().unwrap().in_flight.load(Relaxed)
 }
 
-impl BrokenRing {
-    fn new(handle: &Handle) -> Self {
-        let ring_fd = handle.get_uring().lock().ring().as_raw_fd();
-        let null = std::fs::File::open("/dev/null").unwrap();
-        // SAFETY: `dup` and `dup2` are valid for any open file descriptor.
-        let saved = unsafe { libc::dup(ring_fd) };
-        assert!(saved >= 0);
-        let rc = unsafe { libc::dup2(null.as_raw_fd(), ring_fd) };
-        assert_eq!(rc, ring_fd);
-        Self { ring_fd, saved }
-    }
-}
-
-impl Drop for BrokenRing {
-    fn drop(&mut self) {
-        // SAFETY: `saved` is a live descriptor duplicated from the ring.
-        unsafe {
-            libc::dup2(self.saved, self.ring_fd);
-            libc::close(self.saved);
-        }
-    }
-}
-
-// Once an entry is pushed onto the submission queue the kernel may already own
-// the buffer it points at, so a failing submission must keep the slot instead of
-// dropping the op and freeing the buffer while it is still in use.
+// Registering only pushes the entry; the driver submits it and dispatches the
+// completion on its next turn.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn register_op_keeps_entry_on_submit_failure() {
-    let Some((_driver, handle)) = ready_handle() else {
+fn op_completes_after_driver_turn() {
+    let Some((mut driver, handle)) = ready_handle() else {
         return;
     };
 
-    let broken = BrokenRing::new(&handle);
+    let mut cx = Context::from_waker(Waker::noop());
 
-    let entry = opcode::Nop::new().build();
     // SAFETY: the no-op entry does not reference any buffer.
-    let res = unsafe { handle.register_op(entry, futures::task::noop_waker()) };
+    let lifecycle = unsafe { handle.register_op(opcode::Nop::new().build(), Waker::noop()) }
+        .expect("the submission queue has room");
+    assert!(lifecycle.poll(&mut cx).is_pending());
+    assert_eq!(in_flight(&handle), 1);
 
-    // The entry was pushed before the submit failed, so the slot is kept and its
-    // index handed back for the caller to cancel.
-    let RegisterResult::Pushed { index, .. } = res else {
-        panic!("expected Pushed after a post-push submit failure");
+    let mut res = Poll::Pending;
+    for _ in 0..100 {
+        driver.turn(&handle, Some(Duration::from_millis(10)));
+        res = lifecycle.poll(&mut cx);
+        if res.is_ready() {
+            break;
+        }
+    }
+
+    assert_eq!(res, Poll::Ready(0));
+    assert_eq!(in_flight(&handle), 0);
+}
+
+// A full submission queue hands the entry back instead of blocking, and has
+// room again once the driver has submitted.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn full_submission_queue_hands_entry_back() {
+    let Some((mut driver, handle)) = ready_handle() else {
+        return;
     };
-    assert!(matches!(
-        handle.get_uring().lock().ops.get(index),
-        Some(Lifecycle::Waiting(_))
-    ));
 
-    drop(broken);
+    let mut ops = Vec::new();
+    for _ in 0..DEFAULT_RING_SIZE {
+        // SAFETY: the no-op entry does not reference any buffer.
+        let op = unsafe { handle.register_op(opcode::Nop::new().build(), Waker::noop()) };
+        ops.push(op.expect("the submission queue has room"));
+    }
+
+    // SAFETY: the no-op entry does not reference any buffer.
+    let full = unsafe { handle.register_op(opcode::Nop::new().build(), Waker::noop()) };
+    assert!(full.is_err());
+    assert_eq!(in_flight(&handle), DEFAULT_RING_SIZE as usize);
+
+    driver.turn(&handle, Some(Duration::ZERO));
+
+    // SAFETY: the no-op entry does not reference any buffer.
+    let retried = unsafe { handle.register_op(opcode::Nop::new().build(), Waker::noop()) };
+    assert!(retried.is_ok());
 }

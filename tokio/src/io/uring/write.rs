@@ -2,7 +2,7 @@ use crate::runtime::driver::op::{CancelData, Cancellable, Completable, CqeResult
 use crate::util::as_ref::OwnedBuf;
 
 use io_uring::{opcode, types};
-use std::io::{self, Error};
+use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 #[derive(Debug)]
@@ -17,14 +17,6 @@ impl Completable for Write {
     type Output = (io::Result<u32>, Option<OwnedBuf>, Option<OwnedFd>);
     fn complete(self, cqe: CqeResult) -> Self::Output {
         (cqe.result, Some(self.buf), Some(self.fd))
-    }
-
-    fn complete_with_error(self, err: Error) -> Self::Output {
-        (Err(err), Some(self.buf), Some(self.fd))
-    }
-
-    fn complete_after_cancel(err: Error) -> Self::Output {
-        (Err(err), None, None)
     }
 }
 
